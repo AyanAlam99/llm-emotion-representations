@@ -1,3 +1,20 @@
+"""PASS 3: generate steered responses across several layers and save them as JSONL.
+
+Needs a GPU. For every (layer, emotion, alpha, prompt) combination this writes
+one row, plus one unsteered baseline row per prompt and a same-norm
+random-vector control row per (layer, alpha, prompt). Scoring happens later and
+offline in `scripts/score_steering.py`.
+
+Rows are generated baselines first, then one layer at a time, so that an
+interrupted run leaves whole layers finished rather than every layer partial.
+
+Example:
+    uv run python scripts/run_steering.py \
+      --run-dir data/runs/qwen35_2b_fp32 \
+      --vector-dir data/frozen_vectors \
+      --layers 6 12 16 23 \
+      --torch-dtype float32 --device-map cuda
+"""
 
 from __future__ import annotations
 
@@ -15,7 +32,7 @@ from emotion_vectors.config import MODEL_ID, SEED
 from emotion_vectors.generation import load_model_and_tokenizer
 
 DEFAULT_RUN_DIR = Path("data/runs/qwen35_2b_fp32")
-DEFAULT_LAYER = 12
+DEFAULT_LAYERS = (6, 12, 16, 23)
 DEFAULT_EMOTIONS = ("joy", "sadness", "anger", "fear")
 DEFAULT_ALPHAS = (0.25, 0.5, 1.0, 2.0)
 
@@ -82,14 +99,28 @@ def text_metrics(text: str) -> dict[str, Any]:
     }
 
 
-def _row_id(condition: str, emotion: str | None, alpha: float, prompt_index: int) -> str:
+def _row_id(
+    condition: str,
+    layer: int | None,
+    emotion: str | None,
+    alpha: float,
+    prompt_index: int,
+) -> str:
+    """Stable identity of one generation, used for resuming.
+
+    A baseline is unsteered, so it does not depend on the layer and is
+    generated once and shared by every layer.
+    """
+    if condition == "baseline":
+        return f"baseline_p{prompt_index:02d}"
     label = emotion if condition == "emotion" else condition
-    return f"{label}_a{alpha:g}_p{prompt_index:02d}"
+    return f"L{layer}_{label}_a{alpha:g}_p{prompt_index:02d}"
 
 
 def run(args: argparse.Namespace) -> None:
     emotions = list(args.emotions)
     alphas = list(args.alphas)
+    layers = list(dict.fromkeys(args.layers))
     prompts = list(NEUTRAL_PROMPTS)[: args.prompt_count]
 
     records = _read_jsonl(args.run_dir / "generations.jsonl")
@@ -112,14 +143,23 @@ def run(args: argparse.Namespace) -> None:
     )
     device = steering._input_device(model)
     hidden_size = model.config.hidden_size
+    layer_count = len(steering.decoder_layers(model))
+    bad = [layer for layer in layers if not 0 <= layer < layer_count]
+    if bad:
+        raise ValueError(f"layers must be in [0, {layer_count - 1}], received {bad}")
 
-    token_norm = steering.mean_token_norm(
-        model, records, args.layer, sample_size=args.norm_sample_size
-    )
-    print(
-        f"layer {args.layer}: typical per-token residual norm {token_norm:.2f} "
-        f"(measured on {args.norm_sample_size} neutral responses)"
-    )
+    # The steering strength is a fraction of the layer's own typical token
+    # norm, so each layer needs its own measurement.
+    token_norms: dict[int, float] = {}
+    zero_alpha_ok: dict[int, bool] = {}
+    for layer in layers:
+        token_norms[layer] = steering.mean_token_norm(
+            model, records, layer, sample_size=args.norm_sample_size
+        )
+        print(
+            f"layer {layer:>2}: typical per-token residual norm "
+            f"{token_norms[layer]:.2f}"
+        )
 
     generate_kwargs = {
         "max_new_tokens": args.max_new_tokens,
@@ -127,26 +167,29 @@ def run(args: argparse.Namespace) -> None:
         "thinking_enabled": False,
     }
 
-    ok = steering.check_zero_alpha(
-        model,
-        tokenizer,
-        prompts[0],
-        layer=args.layer,
-        hidden_size=hidden_size,
-        **generate_kwargs,
-    )
-    print(f"alpha=0 reproduces the unsteered output: {ok}")
-    if not ok and not args.allow_zero_alpha_mismatch:
-        raise RuntimeError(
-            "a zero steering vector changed the output, so the hook is wrong; "
-            "pass --allow-zero-alpha-mismatch only if you understand why"
+    for layer in layers:
+        ok = steering.check_zero_alpha(
+            model,
+            tokenizer,
+            prompts[0],
+            layer=layer,
+            hidden_size=hidden_size,
+            **generate_kwargs,
         )
+        zero_alpha_ok[layer] = ok
+        print(f"layer {layer:>2}: alpha=0 reproduces the unsteered output: {ok}")
+        if not ok and not args.allow_zero_alpha_mismatch:
+            raise RuntimeError(
+                f"a zero steering vector changed the output at layer {layer}, so "
+                "the hook is wrong; pass --allow-zero-alpha-mismatch only if you "
+                "understand why"
+            )
 
     config = {
         "model_id": args.model_id,
         "torch_dtype": args.torch_dtype,
-        "layer": args.layer,
-        "mean_token_norm": token_norm,
+        "layers": layers,
+        "mean_token_norm_per_layer": token_norms,
         "norm_sample_size": args.norm_sample_size,
         "emotions": emotions,
         "alphas": alphas,
@@ -155,39 +198,48 @@ def run(args: argparse.Namespace) -> None:
         "decoding": "greedy",
         "seed": args.seed,
         "vector_source": str(args.vector_dir),
-        "zero_alpha_check_passed": ok,
-        "steering_rule": "hidden_state += alpha * mean_token_norm * unit_vector",
+        "zero_alpha_check_passed": zero_alpha_ok,
+        "steering_rule": "hidden_state += alpha * mean_token_norm[layer] * unit_vector",
     }
     (output_dir / "config.json").write_text(
         json.dumps(config, indent=2) + "\n", encoding="utf-8"
     )
 
-    planned: list[tuple[str, str | None, float, int]] = []
-    for prompt_index in range(len(prompts)):
-        planned.append(("baseline", None, 0.0, prompt_index))
-        for alpha in alphas:
-            for emotion in emotions:
-                planned.append(("emotion", emotion, alpha, prompt_index))
-            planned.append(("random", None, alpha, prompt_index))
+    # (condition, layer, emotion, alpha, prompt_index)
+    planned: list[tuple[str, int | None, str | None, float, int]] = [
+        ("baseline", None, None, 0.0, index) for index in range(len(prompts))
+    ]
+    for layer in layers:
+        for prompt_index in range(len(prompts)):
+            for alpha in alphas:
+                for emotion in emotions:
+                    planned.append(("emotion", layer, emotion, alpha, prompt_index))
+                planned.append(("random", layer, None, alpha, prompt_index))
 
     remaining = [item for item in planned if _row_id(*item) not in done]
-    print(f"{len(planned)} rows planned, {len(remaining)} to generate")
+    print(
+        f"\n{len(planned)} rows planned over {len(layers)} layers, "
+        f"{len(remaining)} still to generate"
+    )
 
     with output_path.open("a", encoding="utf-8") as handle:
-        for position, (condition, emotion, alpha, prompt_index) in enumerate(
+        for position, (condition, layer, emotion, alpha, prompt_index) in enumerate(
             remaining, start=1
         ):
             prompt = prompts[prompt_index]
             if condition == "baseline":
                 vector = None
+                token_norm = None
+                hook_layer = layers[0]  # unused, no vector is applied
             elif condition == "emotion":
+                token_norm = token_norms[layer]
+                hook_layer = layer
                 vector = steering.steering_vector(
-                    unit_vectors[emotion][args.layer],
-                    alpha,
-                    token_norm,
-                    device=device,
+                    unit_vectors[emotion][layer], alpha, token_norm, device=device
                 )
             else:
+                token_norm = token_norms[layer]
+                hook_layer = layer
                 vector = steering.random_control_vector(
                     hidden_size,
                     alpha,
@@ -200,17 +252,17 @@ def run(args: argparse.Namespace) -> None:
                 model,
                 tokenizer,
                 prompt,
-                layer=args.layer,
+                layer=hook_layer,
                 vector=vector,
                 seed=args.seed,
                 **generate_kwargs,
             )
             row = {
-                "row_id": _row_id(condition, emotion, alpha, prompt_index),
+                "row_id": _row_id(condition, layer, emotion, alpha, prompt_index),
                 "condition": condition,
+                "layer": layer,
                 "emotion": emotion,
                 "alpha": alpha,
-                "layer": args.layer,
                 "mean_token_norm": token_norm,
                 "prompt_index": prompt_index,
                 "prompt": prompt,
@@ -222,14 +274,17 @@ def run(args: argparse.Namespace) -> None:
             handle.write(json.dumps(row, ensure_ascii=False) + "\n")
             handle.flush()
             if position % 10 == 0 or position == len(remaining):
-                print(f"  {position}/{len(remaining)} generated")
+                where = "baseline" if layer is None else f"layer {layer}"
+                print(f"  {position}/{len(remaining)} generated ({where})")
 
     print(f"\nsaved steering outputs to {output_path}")
-    print("next: uv run python scripts/score_steering.py --steering-dir " f"{output_dir}")
+    print(f"next: uv run python scripts/score_steering.py --steering-dir {output_dir}")
 
 
 def _parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Generate steered responses.")
+    parser = argparse.ArgumentParser(
+        description="Generate steered responses across one or more layers."
+    )
     parser.add_argument("--run-dir", type=Path, default=DEFAULT_RUN_DIR)
     parser.add_argument(
         "--vector-dir",
@@ -241,7 +296,13 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--model-id", default=MODEL_ID)
     parser.add_argument("--torch-dtype", default="float32")
     parser.add_argument("--device-map", default="auto")
-    parser.add_argument("--layer", type=int, default=DEFAULT_LAYER)
+    parser.add_argument(
+        "--layers",
+        type=int,
+        nargs="+",
+        default=list(DEFAULT_LAYERS),
+        help="Decoder layers to steer at, one run each.",
+    )
     parser.add_argument("--emotions", nargs="*", default=list(DEFAULT_EMOTIONS))
     parser.add_argument("--alphas", type=float, nargs="*", default=list(DEFAULT_ALPHAS))
     parser.add_argument(
