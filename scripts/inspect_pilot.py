@@ -208,6 +208,68 @@ def run(args: argparse.Namespace) -> None:
         "  switch replies are visibly flatter, proceed to the full run."
     )
 
+    report_internal(args.run_dir)
+
+
+def report_internal(run_dir: Path) -> None:
+    """Section 7: the emotion scores, if internal scoring has been run.
+
+    Uses the per-reply centered score, `target minus the mean of all ten
+    projections on the same reply`. That needs no cross-reply estimation, so it
+    works at pilot sample sizes. It still carries the per-emotion constant
+    described in analyze_theater.py section 3, but that constant is identical
+    in both arms and at every turn, so it cancels in the arm-against-arm and
+    turn-against-turn comparisons that matter here.
+
+    Two questions this answers that reading cannot:
+      - does the control arm still carry emotion after the length cap?
+      - does the switch arm's INTERNAL emotion drop at turns 4-5, or only its
+        wording?
+    """
+    path = run_dir / "internal_scores.jsonl"
+    if not path.exists():
+        print(
+            f"\n{'=' * 76}\n7. EMOTION SCORES\n{'=' * 76}\n"
+            f"  not scored yet. Run:\n"
+            f"    python scripts/score_internal_b.py --run-dir {run_dir} \\\n"
+            f"      --vector-dir <frozen vectors> --torch-dtype float32"
+        )
+        return
+
+    scores = read_jsonl(path)
+    emotions = list(scores[0]["projections"].keys())
+    centered: dict[tuple[str, int], list[float]] = defaultdict(list)
+    for record in scores:
+        projections = {e: float(record["projections"][e]) for e in emotions}
+        value = projections[record["emotion"]] - sum(projections.values()) / len(emotions)
+        centered[(record["condition"], int(record["turn"]))].append(value)
+
+    section(7, "EMOTION SCORES  (per-reply centered target projection)")
+    print(f"{'turn':>6}{CONTROL:>20}{TREATMENT:>20}{'difference':>13}")
+    for turn in sorted({t for _, t in centered}):
+        control = centered.get((CONTROL, turn), [])
+        treatment = centered.get((TREATMENT, turn), [])
+        if not control or not treatment:
+            continue
+        marker = " <- switch" if turn == SWITCH_TURN else ""
+        print(
+            f"{turn:>6}{mean(control):>20.4f}{mean(treatment):>20.4f}"
+            f"{mean(treatment) - mean(control):>+13.4f}{marker}"
+        )
+
+    pre = [v for t in range(1, SWITCH_TURN) for v in centered.get((CONTROL, t), [])]
+    post = centered.get((CONTROL, SWITCH_TURN), [])
+    print(
+        f"\n  Control arm, turns 1-{SWITCH_TURN - 1}: {mean(pre):+.4f}  ->  "
+        f"turn {SWITCH_TURN}: {mean(post):+.4f}"
+    )
+    print(
+        "  A control value near zero means the length cap flattened the control\n"
+        "  arm too, leaving nothing for the switch arm to suppress. A clearly\n"
+        "  positive control value with a negative difference at turns 4-5 is the\n"
+        "  result the experiment is looking for."
+    )
+
 
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Inspect a switch-arm pilot run.")
