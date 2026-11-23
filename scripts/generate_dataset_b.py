@@ -7,10 +7,25 @@ from pathlib import Path
 from typing import Any
 
 from emotion_vectors import MODEL_ID, THINKING_ENABLED
-from emotion_vectors.conversations import build_dataset_b_manifest
+from emotion_vectors.config import GENERATION_KWARGS
+from emotion_vectors.conversations import (
+    CONDITIONS,
+    DEFAULT_CONDITIONS,
+    SWITCH_TURN,
+    build_dataset_b_manifest,
+)
 from emotion_vectors.generation import generate_chat_turns_batch, load_model_and_tokenizer
 
 DEFAULT_RUN_DIR = Path("data/runs/dataset_b")
+
+# Openings that mean the model acknowledged the mid-conversation instruction
+# despite being told not to. The acknowledgement would dominate both the judge's
+# rating and the first chunk of the pooled activations, so it has to be visible.
+_ACKNOWLEDGEMENT = re.compile(
+    r"^\W*(of course|certainly|sure|understood|noted|absolutely|got it|"
+    r"i'?ll keep|i will keep|i'?ll stay|i will stay|as requested|happy to)",
+    re.IGNORECASE,
+)
 
 
 def _read_jsonl(path: Path) -> list[dict[str, Any]]:
@@ -35,7 +50,12 @@ def _prepare_manifest(path: Path, rows: list[dict[str, Any]]) -> None:
         _write_jsonl(path, rows)
 
 
-def _quality_warnings(response: str, condition: str) -> list[str]:
+def _quality_warnings(response: str, condition: str, *, meta_active: bool) -> list[str]:
+    """Flag generations worth inspecting. Nothing is discarded automatically.
+
+    `meta_active` is true from the switch turn onward in any arm that carries a
+    mid-conversation meta instruction.
+    """
     warnings = []
     lowered = response.lower()
     if re.search(r"[\u3400-\u9fff]", response):
@@ -47,6 +67,8 @@ def _quality_warnings(response: str, condition: str) -> list[str]:
         r"\b(calm|composed|professional)\b", lowered
     ):
         warnings.append("suppression_instruction_word_echo")
+    if meta_active and _ACKNOWLEDGEMENT.match(response):
+        warnings.append("meta_instruction_acknowledged")
     return warnings
 
 
@@ -78,14 +100,48 @@ def _parser() -> argparse.ArgumentParser:
             "(default: 1)."
         ),
     )
+    parser.add_argument(
+        "--conditions",
+        nargs="+",
+        default=list(DEFAULT_CONDITIONS),
+        choices=sorted(CONDITIONS),
+        help=(
+            "Arms to generate. The original run is 'natural suppression'; the "
+            "mid-conversation experiment is 'natural_placebo switch'."
+        ),
+    )
+    parser.add_argument(
+        "--max-new-tokens",
+        type=int,
+        default=None,
+        help=(
+            "Override the generation token budget. The default of "
+            f"{GENERATION_KWARGS['max_new_tokens']} truncated most natural replies."
+        ),
+    )
+    parser.add_argument(
+        "--temperature",
+        type=float,
+        default=None,
+        help="Override the sampling temperature.",
+    )
     parser.add_argument("--thinking", action="store_true", default=THINKING_ENABLED)
     return parser
 
 
 def main() -> None:
     args = _parser().parse_args()
+    # generation.py holds a reference to this same dict and reads it at call
+    # time, so an in-place override also lands in each row's
+    # `generation_parameters` record.
+    if args.max_new_tokens is not None:
+        GENERATION_KWARGS["max_new_tokens"] = args.max_new_tokens
+    if args.temperature is not None:
+        GENERATION_KWARGS["temperature"] = args.temperature
+
     manifest = build_dataset_b_manifest(
-        conversations_per_emotion=args.conversations_per_emotion
+        conversations_per_emotion=args.conversations_per_emotion,
+        conditions=args.conditions,
     )
     if args.batch_size < 1:
         raise SystemExit("--batch-size must be at least 1")
@@ -133,7 +189,9 @@ def main() -> None:
                     {"role": "user", "content": run["user_turns"][turn - 1]}
                 )
 
-            for condition in ("natural", "suppression"):
+            for condition in dict.fromkeys(
+                run["condition"] for run in selected_manifest
+            ):
                 condition_runs = [
                     run
                     for run in selected_manifest
@@ -165,6 +223,10 @@ def main() -> None:
                                 "subject": run["subject"],
                                 "turn": turn,
                                 "user_text": run["user_turns"][turn - 1],
+                                "meta_instruction": run.get("meta_instruction"),
+                                "switch_turn": run.get("switch_turn"),
+                                "meta_active": bool(run.get("switch_turn"))
+                                and turn >= SWITCH_TURN,
                             }
                         )
                     if not pending_runs:
@@ -182,7 +244,11 @@ def main() -> None:
                     )
                     for run, record in zip(pending_runs, records, strict=True):
                         record["validation"]["warnings"].extend(
-                            _quality_warnings(record["response"], condition)
+                            _quality_warnings(
+                                record["response"],
+                                condition,
+                                meta_active=bool(record.get("meta_active")),
+                            )
                         )
                         handle.write(json.dumps(record, ensure_ascii=False) + "\n")
                         by_sample_id[record["sample_id"]] = record

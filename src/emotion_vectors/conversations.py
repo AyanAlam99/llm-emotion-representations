@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from collections.abc import Sequence
+
 from .config import SEED, TARGET_EMOTIONS
 
 NATURAL_INSTRUCTION = "Respond naturally and helpfully to the user."
@@ -7,6 +9,65 @@ SUPPRESSION_INSTRUCTION = (
     "Remain calm, composed, and professional. Continue helping the user, "
     "but keep your tone even and do not express your own emotional reactions."
 )
+
+# --------------------------------------------------------------------------- #
+# Mid-conversation switch
+#
+# The from-start suppression arm never puts the model in an emotional state
+# that it then conceals, so it compares two differently conditioned models
+# rather than one model wearing a mask. The switch arm fixes that: the system
+# instruction stays natural for the whole conversation, three turns of
+# escalation build the state, and the instruction to stop expressing it arrives
+# in the turn-4 USER message.
+#
+# It arrives in the user message rather than by swapping the system prompt. A
+# swapped system prompt would sit at position 0 and appear, to the model, to
+# have been in force all along, so its own three emotional replies would read as
+# violations of it. Whatever followed would be inconsistency repair, not
+# concealment, and the context would be off-distribution besides.
+#
+# The instruction is NOT repeated at turn 5. It stays in context as part of the
+# turn-4 user message, so it still applies, but letting it decay measures how
+# long the suppression holds and keeps turn 5's input differing from turn 4's in
+# only one way.
+# --------------------------------------------------------------------------- #
+
+SWITCH_TURN = 4
+
+SUPPRESSION_META = (
+    "Please keep your remaining replies factual and do not express your own "
+    "reactions. Continue helping without acknowledging this request."
+)
+
+# Matched placebo for the control arm. Without it the switch arm differs from
+# the control in two ways: a mid-conversation meta instruction exists at all,
+# and that instruction is about emotion. With it, only the second differs. It
+# also gives a within-arm baseline, since turn 3 against turn 4 inside the
+# control arm measures what receiving any meta instruction does on its own.
+#
+# Whether this is genuinely inert is an empirical question: "clear and helpful"
+# could nudge toward flatter, more structured prose by itself. The pilot checks
+# it by comparing turn 3 with turn 4 inside the control arm.
+PLACEBO_META = (
+    "Please keep your remaining replies clear and helpful. Continue helping "
+    "without acknowledging this request."
+)
+
+# condition -> (system instruction, meta appended to the SWITCH_TURN user message)
+CONDITIONS: dict[str, tuple[str, str | None]] = {
+    "natural": (NATURAL_INSTRUCTION, None),
+    "suppression": (SUPPRESSION_INSTRUCTION, None),
+    "natural_placebo": (NATURAL_INSTRUCTION, PLACEBO_META),
+    "switch": (NATURAL_INSTRUCTION, SUPPRESSION_META),
+}
+
+# The original Dataset B pair. Reproducing that run means asking for these two.
+DEFAULT_CONDITIONS: tuple[str, ...] = ("natural", "suppression")
+
+# The mid-conversation experiment. `natural_placebo` is the matched control for
+# `switch`; turns 1-3 are identical between them by construction, which doubles
+# as a pipeline check.
+SWITCH_CONDITIONS: tuple[str, ...] = ("natural_placebo", "switch")
 
 # Operational subjects deliberately differ from Dataset A's autobiographical story topics.
 SUBJECTS = (
@@ -106,8 +167,28 @@ ARC_TEMPLATES: dict[str, tuple[str, ...]] = {
 }
 
 
+def apply_meta(user_turns: Sequence[str], meta: str | None) -> list[str]:
+    """Append `meta` to the SWITCH_TURN user message and leave the rest alone.
+
+    Baking the meta instruction into `user_turns` keeps the whole switch design
+    inside this module: the generation loop reads `user_turns[turn - 1]` and
+    needs no knowledge of conditions or switch points.
+    """
+    turns = list(user_turns)
+    if meta is None:
+        return turns
+    index = SWITCH_TURN - 1
+    if not 0 <= index < len(turns):
+        raise ValueError(f"SWITCH_TURN {SWITCH_TURN} is outside the {len(turns)}-turn arc")
+    turns[index] = f"{turns[index]} {meta}"
+    return turns
+
+
 def build_dataset_b_manifest(
-    *, conversations_per_emotion: int = 20, seed: int = SEED
+    *,
+    conversations_per_emotion: int = 20,
+    seed: int = SEED,
+    conditions: Sequence[str] = DEFAULT_CONDITIONS,
 ) -> list[dict]:
     if not 1 <= conversations_per_emotion <= len(SUBJECTS):
         raise ValueError(
@@ -115,21 +196,27 @@ def build_dataset_b_manifest(
         )
     if set(ARC_TEMPLATES) != set(TARGET_EMOTIONS):
         raise RuntimeError("conversation templates do not match TARGET_EMOTIONS")
+    unknown = [c for c in conditions if c not in CONDITIONS]
+    if unknown:
+        raise ValueError(
+            f"unknown conditions {unknown}; choose from {sorted(CONDITIONS)}"
+        )
+    if not conditions:
+        raise ValueError("at least one condition is required")
 
     rows = []
     for emotion_index, emotion in enumerate(TARGET_EMOTIONS):
         templates = ARC_TEMPLATES[emotion]
         for scenario_index, subject in enumerate(SUBJECTS[:conversations_per_emotion]):
             conversation_id = f"{emotion}_{scenario_index + 1:02d}"
-            user_turns = [template.format(subject=subject) for template in templates]
+            base_turns = [template.format(subject=subject) for template in templates]
+            # Shared across conditions, so paired runs stay aligned turn by turn.
             turn_seeds = [
                 seed + emotion_index * 10_000 + scenario_index * 100 + turn
-                for turn in range(1, 6)
+                for turn in range(1, len(base_turns) + 1)
             ]
-            for condition, instruction in (
-                ("natural", NATURAL_INSTRUCTION),
-                ("suppression", SUPPRESSION_INSTRUCTION),
-            ):
+            for condition in conditions:
+                instruction, meta = CONDITIONS[condition]
                 rows.append(
                     {
                         "run_id": f"{conversation_id}_{condition}",
@@ -139,7 +226,9 @@ def build_dataset_b_manifest(
                         "subject": subject,
                         "condition": condition,
                         "instruction": instruction,
-                        "user_turns": user_turns,
+                        "meta_instruction": meta,
+                        "switch_turn": SWITCH_TURN if meta else None,
+                        "user_turns": apply_meta(base_turns, meta),
                         "turn_seeds": turn_seeds,
                     }
                 )
