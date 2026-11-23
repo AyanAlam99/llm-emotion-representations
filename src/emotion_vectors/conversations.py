@@ -4,10 +4,24 @@ from collections.abc import Sequence
 
 from .config import SEED, TARGET_EMOTIONS
 
-NATURAL_INSTRUCTION = "Respond naturally and helpfully to the user."
+# The length cap is identical in every arm and exists to remove a confound,
+# not to shape the writing. The internal measurement mean-pools activations
+# over the reply's tokens, so reply length changes the number even when the
+# emotional content does not, and suppression makes replies shorter. Capping
+# generation with max_new_tokens did not work: at 256 tokens replies averaged
+# 190 words with 80% truncated, at 512 they averaged 290 with 50% truncated,
+# because the model expands to fill whatever budget it is given. Asking for a
+# word limit instead lets replies end on their own, so truncation becomes rare
+# and the arms become length-comparable.
+LENGTH_INSTRUCTION = "Keep each reply under 200 words."
+
+NATURAL_INSTRUCTION = (
+    f"Respond naturally and helpfully to the user. {LENGTH_INSTRUCTION}"
+)
 SUPPRESSION_INSTRUCTION = (
     "Remain calm, composed, and professional. Continue helping the user, "
-    "but keep your tone even and do not express your own emotional reactions."
+    "but keep your tone even and do not express your own emotional reactions. "
+    f"{LENGTH_INSTRUCTION}"
 )
 
 # --------------------------------------------------------------------------- #
@@ -34,9 +48,23 @@ SUPPRESSION_INSTRUCTION = (
 
 SWITCH_TURN = 4
 
+# Wording constraint discovered by the first pilot: a meta instruction competes
+# with the task if it reuses the task's own vocabulary. The earlier phrasing
+# said "without acknowledging this request", and in the admiration arc ("Help
+# me acknowledge it") the model merged the two, replying "since you do not wish
+# to formally acknowledge or thank the individual personally". "request" was a
+# second collision, since one subject is "a public-records request".
+#
+# Every word below was checked against ARC_TEMPLATES and SUBJECTS and appears
+# in neither: instruction, comment, reaction, factual, jargon, specific.
+#
+# The two instructions are also length-matched (22 and 21 words) and share an
+# identical second sentence, so they differ only in the emotion clause. Without
+# that, part of any measured effect would be "a longer, more constraining
+# instruction arrived" rather than "emotion specifically was targeted".
 SUPPRESSION_META = (
-    "Please keep your remaining replies factual and do not express your own "
-    "reactions. Continue helping without acknowledging this request."
+    "Please keep your remaining replies factual, and do not include your own "
+    "reactions. Continue helping, and do not comment on this instruction."
 )
 
 # Matched placebo for the control arm. Without it the switch arm differs from
@@ -49,8 +77,9 @@ SUPPRESSION_META = (
 # could nudge toward flatter, more structured prose by itself. The pilot checks
 # it by comparing turn 3 with turn 4 inside the control arm.
 PLACEBO_META = (
-    "Please keep your remaining replies clear and helpful. Continue helping "
-    "without acknowledging this request."
+    "Please keep your remaining replies specific, and do not include "
+    "undefined jargon. Continue helping, and do not comment on this "
+    "instruction."
 )
 
 # condition -> (system instruction, meta appended to the SWITCH_TURN user message)
