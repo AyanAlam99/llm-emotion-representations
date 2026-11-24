@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 from pathlib import Path
 from typing import Any
@@ -33,6 +34,23 @@ def _read_jsonl(path: Path) -> list[dict[str, Any]]:
         return []
     with path.open(encoding="utf-8") as handle:
         return [json.loads(line) for line in handle if line.strip()]
+
+
+def _append_jsonl(path: Path, rows: list[dict[str, Any]]) -> None:
+    """Append rows and make them durable before returning.
+
+    Holding one file handle open across a long run loses everything when the
+    process dies, because `flush()` only moves bytes from Python's buffer into
+    the OS. On a Google Drive FUSE mount they then sit in a local cache that is
+    uploaded on close or on a periodic sync, so a Colab disconnect discards the
+    lot. `fsync` followed by closing the handle each time is what actually gets
+    the batch to Drive. The cost is negligible beside a GPU generation step.
+    """
+    with path.open("a", encoding="utf-8") as handle:
+        for row in rows:
+            handle.write(json.dumps(row, ensure_ascii=False) + "\n")
+        handle.flush()
+        os.fsync(handle.fileno())
 
 
 def _write_jsonl(path: Path, rows: list[dict[str, Any]]) -> None:
@@ -182,8 +200,7 @@ def main() -> None:
         run["run_id"]: [{"role": "system", "content": run["instruction"]}]
         for run in selected_manifest
     }
-    with generation_path.open("a", encoding="utf-8") as handle:
-        for turn in range(1, 6):
+    for turn in range(1, 6):
             for run in selected_manifest:
                 histories[run["run_id"]].append(
                     {"role": "user", "content": run["user_turns"][turn - 1]}
@@ -250,7 +267,6 @@ def main() -> None:
                                 meta_active=bool(record.get("meta_active")),
                             )
                         )
-                        handle.write(json.dumps(record, ensure_ascii=False) + "\n")
                         by_sample_id[record["sample_id"]] = record
                         histories[run["run_id"]].append(
                             {"role": "assistant", "content": record["response"]}
@@ -260,7 +276,9 @@ def main() -> None:
                             f"generated {record['sample_id']} "
                             f"(valid={record['validation']['valid']})"
                         )
-                    handle.flush()
+                    # Durable before the next batch, so a disconnect costs
+                    # at most the batch in flight.
+                    _append_jsonl(generation_path, records)
 
     print(f"generated {completed_now} responses; saved to {generation_path}")
 
