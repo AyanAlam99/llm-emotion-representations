@@ -117,8 +117,11 @@ def run_claude(
         "--strict-mcp-config",
         "--setting-sources",
         "project",
-        "--permission-prompts",
-        "none",
+        # `--permission-prompts none` used to sit here and was removed from the
+        # Claude Code CLI. No replacement is needed: the judge transforms text
+        # into JSON against --json-schema and never calls a tool, so no
+        # permission is ever requested. --safe-mode already disables
+        # customizations, and the timeout below is the backstop.
         "--json-schema",
         json.dumps(schema(), separators=(",", ":")),
     ]
@@ -129,7 +132,12 @@ def run_claude(
                 input=prompt(requests),
                 cwd=cwd,
                 capture_output=True,
-                text=True,
+                # Without an explicit encoding, subprocess uses the locale
+                # default, which is cp1252 on Windows and cannot encode the
+                # emoji that appear in generated replies. Passing `encoding`
+                # also puts the pipes in text mode, so `text=True` is implied.
+                encoding="utf-8",
+                errors="replace",
                 timeout=timeout,
                 check=False,
             )

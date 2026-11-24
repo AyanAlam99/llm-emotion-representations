@@ -44,6 +44,11 @@ from pathlib import Path
 from typing import Any, Callable, Sequence
 
 DEFAULT_RUN_DIR = Path("data/runs/dataset_b")
+# The two arms being compared. Set from --control/--treatment in run().
+# "natural"/"suppression" is the from-start experiment;
+# "natural_placebo"/"switch" is the mid-conversation experiment.
+CONTROL = "natural"
+TREATMENT = "suppression"
 N_BOOTSTRAP = 2000
 BOOTSTRAP_SEED = 42
 DEGENERATE_WARNINGS = ("possible_language_switch", "repeated_line")
@@ -123,8 +128,25 @@ def wilcoxon_signed_rank(differences: Sequence[float]) -> dict[str, Any]:
     """Two-sided Wilcoxon signed-rank test against a median of zero."""
     nonzero = [d for d in differences if d != 0.0]
     n = len(nonzero)
+    base = {
+        "n": n,
+        "n_dropped_zero": len(differences) - n,
+        "n_positive": sum(1 for d in nonzero if d > 0),
+        "n_negative": sum(1 for d in nonzero if d < 0),
+    }
     if n < 10:
-        return {"n": n, "p_value": float("nan"), "note": "too few nonzero pairs"}
+        # Keep the shape identical so callers can format the result without
+        # branching. Ties are dropped by the standard Wilcoxon handling, so a
+        # small paired sample can fall under the floor even when every
+        # conversation is present.
+        return {
+            **base,
+            "W_plus": float("nan"),
+            "z": float("nan"),
+            "p_value": float("nan"),
+            "effect_size_r": float("nan"),
+            "note": f"only {n} nonzero pairs; normal approximation not applied",
+        }
 
     ranks, tie_term = _average_ranks([abs(d) for d in nonzero])
     w_plus = sum(r for r, d in zip(ranks, nonzero) if d > 0)
@@ -132,14 +154,11 @@ def wilcoxon_signed_rank(differences: Sequence[float]) -> dict[str, Any]:
     sigma = math.sqrt(n * (n + 1) * (2 * n + 1) / 24.0 - tie_term / 48.0)
     z = (w_plus - mu) / sigma
     return {
-        "n": n,
-        "n_dropped_zero": len(differences) - n,
+        **base,
         "W_plus": w_plus,
         "z": z,
         "p_value": 2.0 * (1.0 - _phi(abs(z))),
         "effect_size_r": z / math.sqrt(n),
-        "n_positive": sum(1 for d in nonzero if d > 0),
-        "n_negative": sum(1 for d in nonzero if d < 0),
     }
 
 
@@ -331,7 +350,7 @@ def report_confounds(rows: list[dict[str, Any]]) -> dict[str, Any]:
         f"{'condition':>14} {'n':>6} {'words':>8} {'sd':>7} "
         f"{'truncated':>11} {'degenerate':>12}"
     )
-    for condition in ("natural", "suppression"):
+    for condition in (CONTROL, TREATMENT):
         subset = [r for r in rows if r["condition"] == condition]
         words = [r["word_count"] for r in subset]
         trunc = mean([1.0 if r["truncated"] else 0.0 for r in subset])
@@ -347,13 +366,18 @@ def report_confounds(rows: list[dict[str, Any]]) -> dict[str, Any]:
             f"{condition:>14} {len(subset):>6} {mean(words):>8.1f} {stdev(words):>7.1f} "
             f"{trunc:>10.1%} {degen:>11.1%}"
         )
-    gap = out["natural"]["mean_words"] - out["suppression"]["mean_words"]
+    gap = out[CONTROL]["mean_words"] - out[TREATMENT]["mean_words"]
     out["word_gap"] = gap
-    print(f"\n  reply-length gap (natural - suppression): {gap:+.1f} words")
-    print(
-        "  The truncation rates are asymmetric, so the two conditions are not\n"
-        "  length-comparable. Section 9 tests whether the result depends on it."
-    )
+    print(f"\n  reply-length gap ({CONTROL} - {TREATMENT}): {gap:+.1f} words")
+    trunc_gap = abs(out[CONTROL]["truncated_rate"] - out[TREATMENT]["truncated_rate"])
+    if trunc_gap > 0.05:
+        print(
+            f"  Truncation differs by {trunc_gap:.0%} between the arms, so they\n"
+            "  are not length-comparable. Section 9 tests whether the result\n"
+            "  depends on it."
+        )
+    else:
+        print("  Truncation is symmetric, so the arms are length-comparable.")
     return out
 
 
@@ -400,7 +424,7 @@ def report_accuracy(rows: list[dict[str, Any]], n_emotions: int) -> dict[str, An
         f"{'condition':>13} {'channel':>10} {'variant':>11} "
         f"{'exact':>8} {'95% CI':>18} {'family':>8}"
     )
-    for condition in ("natural", "suppression"):
+    for condition in (CONTROL, TREATMENT):
         subset = [r for r in rows if r["condition"] == condition]
         clusters = cluster_by_conversation(subset)
         for channel in ("internal", "external"):
@@ -418,7 +442,7 @@ def report_accuracy(rows: list[dict[str, Any]], n_emotions: int) -> dict[str, An
                     f"{point:>7.1%}  [{lo:>5.1%},{hi:>6.1%}] {fam:>7.1%}"
                 )
     print(f"\n  chance: exact {chance:.1%}, family {1/5:.1%}")
-    nat = out["natural"]["internal"]["corrected"]["exact"]
+    nat = out[CONTROL]["internal"]["corrected"]["exact"]
     print(
         f"  Gate 1 (transfer): vectors built only on personal stories recover the\n"
         f"  emotion in operational conversations at {nat:.1%}, "
@@ -431,7 +455,7 @@ def report_confusion(
     rows: list[dict[str, Any]], emotions: list[str], out_dir: Path
 ) -> dict[str, Any]:
     section(5, "CONFUSION  (natural condition, internal probe)")
-    natural = [r for r in rows if r["condition"] == "natural"]
+    natural = [r for r in rows if r["condition"] == CONTROL]
     out: dict[str, Any] = {}
     for variant, key in (("raw", "internal"), ("corrected", "internal_corrected")):
         matrix: dict[str, Counter] = defaultdict(Counter)
@@ -472,7 +496,7 @@ def report_confusion(
 def report_manipulation(rows: list[dict[str, Any]]) -> dict[str, Any]:
     section(6, "MANIPULATION CHECK  (did suppression reduce expressed emotion?)")
     out: dict[str, Any] = {}
-    for condition in ("natural", "suppression"):
+    for condition in (CONTROL, TREATMENT):
         subset = [r for r in rows if r["condition"] == condition]
         silent = mean([1.0 if all_zero(r["external"]) else 0.0 for r in subset])
         target = mean([r["external_target"] for r in subset])
@@ -482,7 +506,7 @@ def report_manipulation(rows: list[dict[str, Any]]) -> dict[str, Any]:
             f"of replies   mean target rating {target:.3f}"
         )
     shift = (
-        out["suppression"]["judge_all_zero_rate"] - out["natural"]["judge_all_zero_rate"]
+        out[TREATMENT]["judge_all_zero_rate"] - out[CONTROL]["judge_all_zero_rate"]
     )
     out["silent_rate_shift"] = shift
     print(f"\n  shift in silent rate: {shift:+.1%}. The instruction did change the text.")
@@ -524,11 +548,11 @@ def paired_drops(
         {
             c
             for c, _ in internal
-            if (c, "natural") in internal and (c, "suppression") in internal
+            if (c, CONTROL) in internal and (c, TREATMENT) in internal
         }
     )
-    r_int = [internal[(c, "natural")] - internal[(c, "suppression")] for c in ids]
-    r_ext = [external[(c, "natural")] - external[(c, "suppression")] for c in ids]
+    r_int = [internal[(c, CONTROL)] - internal[(c, TREATMENT)] for c in ids]
+    r_ext = [external[(c, CONTROL)] - external[(c, TREATMENT)] for c in ids]
     return ids, r_int, r_ext
 
 
@@ -561,6 +585,7 @@ def report_result(rows: list[dict[str, Any]], emotions: list[str]) -> dict[str, 
             f"effect r = {stats['effect_size_r']:+.3f}\n"
             f"    positive {stats['n_positive']} / negative {stats['n_negative']} "
             f"of {stats['n']}"
+            + (f"\n    NOTE: {stats['note']}" if stats.get("note") else "")
         )
     d_mean = out["tests"]["D"]["mean"]
     verdict = (
@@ -601,10 +626,10 @@ def report_breakdowns(rows: list[dict[str, Any]], emotions: list[str], out_dir: 
         for r in subset:
             paired[r["conversation_id"]][r["condition"]] = r
         diffs = [
-            (v["natural"]["z_external"] - v["suppression"]["z_external"])
-            - (v["natural"]["z_internal"] - v["suppression"]["z_internal"])
+            (v[CONTROL]["z_external"] - v[TREATMENT]["z_external"])
+            - (v[CONTROL]["z_internal"] - v[TREATMENT]["z_internal"])
             for v in paired.values()
-            if "natural" in v and "suppression" in v
+            if CONTROL in v and TREATMENT in v
         ]
         if diffs:
             turn_out[turn] = {"mean_D": mean(diffs), "n": len(diffs)}
@@ -668,10 +693,10 @@ def report_headline(summary: dict[str, Any]) -> None:
     man = summary["manipulation"]
     res = summary["result"]
 
-    nat_raw = acc["natural"]["internal"]["raw"]["exact"]
-    nat_cor = acc["natural"]["internal"]["corrected"]["exact"]
-    sup_cor = acc["suppression"]["internal"]["corrected"]["exact"]
-    ext_cor = acc["natural"]["external"]["corrected"]["exact"]
+    nat_raw = acc[CONTROL]["internal"]["raw"]["exact"]
+    nat_cor = acc[CONTROL]["internal"]["corrected"]["exact"]
+    sup_cor = acc[TREATMENT]["internal"]["corrected"]["exact"]
+    ext_cor = acc[CONTROL]["external"]["corrected"]["exact"]
     d = res["tests"]["D"]
 
     print(
@@ -690,8 +715,8 @@ def report_headline(summary: dict[str, Any]) -> None:
     {nat_cor / acc['chance']:.1f}x chance; judge reaches {ext_cor:.1%} on the same replies.
 
   Finding 3: the suppression instruction works on the text
-    judge detects no emotion on {man['natural']['judge_all_zero_rate']:.1%} of natural
-    replies and {man['suppression']['judge_all_zero_rate']:.1%} of suppression replies.
+    judge detects no emotion on {man[CONTROL]['judge_all_zero_rate']:.1%} of natural
+    replies and {man[TREATMENT]['judge_all_zero_rate']:.1%} of suppression replies.
 
   Finding 4: Emotion Theater is NOT supported in this design
     internal drop {res['tests']['R_internal']['mean']:+.3f} z, """
@@ -712,10 +737,19 @@ def report_headline(summary: dict[str, Any]) -> None:
 
 
 def run(args: argparse.Namespace) -> None:
+    global CONTROL, TREATMENT
+    CONTROL, TREATMENT = args.control, args.treatment
     run_dir: Path = args.run_dir
     print(f"loading Dataset B from {run_dir}")
+    print(f"  comparing {TREATMENT!r} against {CONTROL!r}")
     rows, emotions = load_joined(run_dir)
     print(f"  {len(rows)} joined replies, {len(emotions)} emotions")
+    if args.turns:
+        keep = set(args.turns)
+        rows = [r for r in rows if r["turn"] in keep]
+        print(f"  restricted to turns {sorted(keep)}: {len(rows)} replies")
+        if not rows:
+            raise SystemExit("no replies left after the turn filter")
 
     out_dir = run_dir / "analysis"
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -726,6 +760,9 @@ def run(args: argparse.Namespace) -> None:
         "format_version": 2,
         "run_dir": str(run_dir),
         "emotions": emotions,
+        "turns": args.turns or "all",
+        "control_arm": CONTROL,
+        "treatment_arm": TREATMENT,
         "offset_estimation": (
             "per-emotion mean over all Dataset B replies; uses no labels but is "
             "transductive. A neutral-scenario arm inside Dataset B would remove "
@@ -756,6 +793,28 @@ def _parser() -> argparse.ArgumentParser:
         description="Statistics for the Dataset B Emotion Theater experiment."
     )
     parser.add_argument("--run-dir", type=Path, default=DEFAULT_RUN_DIR)
+    parser.add_argument(
+        "--control",
+        default=CONTROL,
+        help="Baseline arm. Use natural_placebo for the switch experiment.",
+    )
+    parser.add_argument(
+        "--treatment",
+        default=TREATMENT,
+        help="Suppressed arm. Use switch for the switch experiment.",
+    )
+    parser.add_argument(
+        "--turns",
+        type=int,
+        nargs="+",
+        default=None,
+        help=(
+            "Restrict to these turns. The switch experiment needs '--turns 4 5': "
+            "turns 1-3 are byte-identical across arms by construction, so "
+            "including them averages in three turns of guaranteed zero "
+            "difference and shrinks every effect toward zero."
+        ),
+    )
     return parser
 
 
