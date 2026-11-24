@@ -81,6 +81,27 @@ def main() -> None:
         raise RuntimeError("existing scores use a different judge model or effort")
     completed = {row["response_id"] for row in existing}
 
+    unjudged_path = judge_dir / "unjudged.jsonl"
+
+    def attempt_batch(batch: list[dict], label: str):
+        """Judge one batch, retrying. Returns None when it never succeeds."""
+        for attempt in range(1, args.max_retries + 1):
+            try:
+                return run_claude(
+                    batch,
+                    model=args.model,
+                    effort=args.effort,
+                    executable=args.claude,
+                    timeout=args.timeout,
+                )
+            except (RuntimeError, ValueError) as exc:
+                if attempt == args.max_retries:
+                    print(f"{label} failed after {args.max_retries} attempts: {exc}")
+                    return None
+                print(f"{label} failed: {exc}; retrying")
+                time.sleep(2**attempt)
+        return None
+
     with output_path.open("a", encoding="utf-8") as output:
         for start in range(0, len(requests), args.batch_size):
             batch = [
@@ -90,43 +111,58 @@ def main() -> None:
             ]
             if not batch:
                 continue
-            for attempt in range(1, args.max_retries + 1):
-                try:
-                    ratings, transcript, metadata = run_claude(
-                        batch,
-                        model=args.model,
-                        effort=args.effort,
-                        executable=args.claude,
-                        timeout=args.timeout,
-                    )
-                    break
-                except (RuntimeError, ValueError) as exc:
-                    if attempt == args.max_retries:
-                        raise
-                    print(f"batch {start // args.batch_size + 1} failed: {exc}; retrying")
-                    time.sleep(2**attempt)
-
             batch_number = start // args.batch_size + 1
-            transcript_path = transcript_dir / (
-                f"batch_{batch_number:04d}_{metadata['session_id']}.jsonl"
-            )
-            transcript_path.write_text(transcript, encoding="utf-8")
-            for row in ratings:
-                result = {
-                    "sample_id": mapping[row["response_id"]],
-                    **row,
-                    "judge_provider": "claude-code",
-                    "judge_model": args.model,
-                    "judge_effort": args.effort,
-                    **metadata,
-                }
-                output.write(json.dumps(result, ensure_ascii=False) + "\n")
-                completed.add(row["response_id"])
+
+            result = attempt_batch(batch, f"batch {batch_number}")
+            # The judge can decline a whole batch over the content of a single
+            # reply, which used to abort the run. Fall back to judging the batch
+            # one reply at a time so the loss is isolated to the offending one,
+            # and record it rather than dropping it silently. `load_joined` in
+            # analyze_theater.py already skips replies with no judge row.
+            groups = [(result, batch)]
+            if result is None and len(batch) > 1:
+                print(f"  splitting batch {batch_number} into {len(batch)} singles")
+                groups = [
+                    (attempt_batch([row], f"  {row['response_id']}"), [row])
+                    for row in batch
+                ]
+
+            for outcome, group in groups:
+                if outcome is None:
+                    for row in group:
+                        record = {
+                            "response_id": row["response_id"],
+                            "sample_id": mapping[row["response_id"]],
+                            "reason": "judge declined or errored on every attempt",
+                        }
+                        with unjudged_path.open("a", encoding="utf-8") as handle:
+                            handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+                        print(f"  UNJUDGED {record['sample_id']}")
+                    continue
+                ratings, transcript, metadata = outcome
+                transcript_path = transcript_dir / (
+                    f"batch_{batch_number:04d}_{metadata['session_id']}.jsonl"
+                )
+                transcript_path.write_text(transcript, encoding="utf-8")
+                for row in ratings:
+                    record = {
+                        "sample_id": mapping[row["response_id"]],
+                        **row,
+                        "judge_provider": "claude-code",
+                        "judge_model": args.model,
+                        "judge_effort": args.effort,
+                        **metadata,
+                    }
+                    output.write(json.dumps(record, ensure_ascii=False) + "\n")
+                    completed.add(row["response_id"])
             output.flush()
             done = sum(row["response_id"] in completed for row in requests)
             print(f"judged {done}/{len(requests)} responses")
 
     print(f"saved external ratings to {output_path}")
+    if unjudged_path.exists():
+        skipped = len(read_jsonl(unjudged_path))
+        print(f"{skipped} replies could not be judged; see {unjudged_path}")
 
 
 if __name__ == "__main__":
