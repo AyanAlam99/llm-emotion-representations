@@ -80,7 +80,10 @@ def fig_accuracy(summary: dict, out: Path, dpi: int) -> Path:
     acc = summary["accuracy"]
     chance = acc["chance"]
     labels, raw, corrected = [], [], []
-    for condition in ("natural", "suppression"):
+    # Arm names vary by experiment: natural/suppression for the from-start
+    # design, natural_placebo/switch for the mid-conversation one. The summary
+    # records which pair was compared.
+    for condition in (summary["control_arm"], summary["treatment_arm"]):
         for channel in ("internal", "external"):
             labels.append(f"{channel}\n{condition}")
             raw.append(acc[condition][channel]["raw"]["exact"] * 100)
